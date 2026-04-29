@@ -5,6 +5,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 import tiktoken
+import time
 
 @dataclass
 class GPTConfig:
@@ -40,11 +41,16 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         # attention (materializes the large (T, T) matrix for all the queries and keys)
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
+
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
+
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         y = (y.transpose(1, 2) # (B, T, nh, hs)
              .contiguous().view(B, T, C)) # re-assemble all head outputs side by side
         # output projection
@@ -129,6 +135,37 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
         return logits, loss
 
+    def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device_type == 'cuda'
+        print(f"using fused AdamW: {use_fused}")
+        if zero_stage == 1:
+            print("using ZeroRedundancyOptimizer")
+            optimizer = ZeroRedundancyOptimizer(**optim_groups[0], optimizer_class=torch.optim.AdamW,
+                                                lr=learning_rate, betas=betas, fused=use_fused)
+            optimizer.add_param_group(optim_groups[1])
+        else:
+            print("using regular AdamW")
+            optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, fused=use_fused)
+        return optimizer
+
     @classmethod
     def from_pretrained(cls, model_type):
         """Loads pretrained GPT-2 model weights from huggingface"""
@@ -208,26 +245,64 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 
+device_type = 'mps'
+device = torch.device(device_type)
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decary_iters, return min learning rate
+    elif it > max_steps:
+        return min_lr
+
+    # 3) in between, use a cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_lr + coeff * (max_lr - min_lr)
+
 torch.manual_seed(1337)
 if torch.mps.is_available():
     torch.mps.manual_seed(1337)
 
-train_loader = DataLoaderLite(4, 32)
+train_loader = DataLoaderLite(2, 1024)
+
+torch.set_float32_matmul_precision("high") # to use tf32
 
 # model = GPT.from_pretrained('gpt2')
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
+model.to(device)
+model = torch.compile(model)
 # model.eval() # since all layers do similar things in training/eval (unlike batchnorm, dropout, etc.), this likely does nothing, but it's good practice
-model.to('mps')
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, betas=(0.9, 0.999), device_type=device_type, zero_stage=0)
+
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
-    x, y = x.to('mps'), y.to('mps')
+    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+        logits, loss = model(x, y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.mps.synchronize()
+    t1 = time.time()
+    dt = t1 - t0
+    tokens_processed = train_loader.B * train_loader.T
+    tokens_per_sec = tokens_processed / dt
+    print(f"step {step}, loss: {loss.item()}, lr: {lr:.4e} norm: {norm:.4f}, dt: {dt * 1000}, tok/s: {tokens_per_sec:.4f}")
 
 import sys; sys.exit(0)
 
